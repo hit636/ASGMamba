@@ -43,7 +43,7 @@ The training scripts for all datasets are located in the `./scripts` directory.
 1. Navigate to the repository's root directory.
 2. Execute the following command:
     ```bash
-    sh ./scripts/ETTh1.sh
+    sh ./scripts/ASGMamba_ETTh1.sh
     ```
 
 **Upon completion of the training:**
