@@ -2,7 +2,8 @@
 
 This is an official implementation of [ASGMamba: Adaptive Spectral Gating Mamba for Multivariate Time Series Forecasting].
 
-<img width="2045" height="1079" alt="image" src="https://github.com/user-attachments/assets/6856de61-ea99-4ac3-a97a-e5e913b0c4a7" />
+<img width="1120" height="790" alt="image" src="https://github.com/user-attachments/assets/e3be103a-8c9c-4afb-a4ff-9ec4e35d08e7" />
+
 
 
 ### Prerequisites
