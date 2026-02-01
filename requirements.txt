@@ -1,0 +1,13 @@
+# PyTorch相关 (从PyTorch官方源安装)
+--index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+torchaudio==2.5.1+cu121
+
+
+# 基础Python依赖 (从PyPI安装)
+--extra-index-url https://pypi.org/simple/
+numpy==1.26.3
+matplotlib
+pandas==2.3.1
+scikit-learn==1.6.1

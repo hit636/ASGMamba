@@ -1,0 +1,59 @@
+graph TD
+    %% 节点样式定义
+    classDef input fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef process fill:#e1f5fe,stroke:#0277bd,stroke-width:2px;
+    classDef mamba fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
+    classDef output fill:#ccff90,stroke:#33691e,stroke-width:2px;
+
+    %% 1. 输入处理
+    Start(Input Tensor):::input --> RevIN[RevIN Normalization]
+    RevIN --> CI_Reshape[CI Reshape & Permute]
+    
+    %% 维度标注
+    Start -.-> |"[B, L, N]"| RevIN
+    CI_Reshape -.-> |"[B*N, L, 1]"| Splitpoint((Fork))
+
+    %% 2. 频率分析分支
+    Splitpoint --> FFT[FFT & Spectral Centroid]:::process
+    FFT --> MLP[Profile Encoder MLP]:::process
+    MLP --> Weights(Kernel Weights):::process
+    
+    %% 维度标注
+    MLP -.-> |"[B*N, 3]"| Weights
+
+    %% 3. Tokenizer 分支
+    Splitpoint --> ConvS[Conv1d Small]:::process
+    Splitpoint --> ConvM[Conv1d Mid]:::process
+    Splitpoint --> ConvL[Conv1d Large]:::process
+    
+    %% 4. 动态融合
+    ConvS & ConvM & ConvL & Weights --> Fusion[Weighted Sum & PosEmbed]:::process
+    
+    %% 维度标注
+    Fusion -.-> |"[B*N, T, D]"| Level1
+
+    %% 5. 层级编码
+    subgraph Hierarchical Encoder
+        Level1[Level 1 Mamba Block]:::mamba
+        Pooling[Token Pooling (Stride=2)]:::process
+        Level2[Level 2 Mamba Block]:::mamba
+        
+        Level1 --> Pooling
+        Pooling --> Level2
+    end
+    
+    %% 维度标注
+    Level1 -.-> |"[B*N, T, D]"| Pooling
+    Pooling -.-> |"[B*N, T/2, D]"| Level2
+
+    %% 6. 解码与输出
+    Level2 --> MeanPool[Global Mean Pooling]:::process
+    MeanPool --> LinearProj[Linear Decoder]:::process
+    LinearProj --> ReshapeBack[Reshape Back]:::process
+    ReshapeBack --> RevIND[RevIN Denorm]:::process
+    RevIND --> End(Prediction):::output
+
+    %% 维度标注
+    MeanPool -.-> |"[B*N, D]"| LinearProj
+    LinearProj -.-> |"[B*N, P]"| ReshapeBack
+    ReshapeBack -.-> |"[B, P, N]"| End
