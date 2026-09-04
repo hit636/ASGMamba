@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.fft
 
 # ================================================================
-# 0. Mamba 依赖 (保持不变)
+# 0. Mamba 依赖 (双向扫描基础)
 # ================================================================
 try:
     from mamba_ssm import Mamba
@@ -18,7 +18,7 @@ except ImportError:
         def forward(self, x): return self.linear(x)
 
 # ================================================================
-# 1. 基础组件
+# 1. 基础组件 (RevIN)
 # ================================================================
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps=1e-5, affine=True):
@@ -42,17 +42,21 @@ class RevIN(nn.Module):
         return x
 
 # ================================================================
-# 2. Patch Router (频域门控)
+# 2. Spectral AdaLN Router (频域自适应层归一化)
 # ================================================================
-class PatchFrequencyRouter(nn.Module):
+class SpectralAdaLNRouter(nn.Module):
     def __init__(self, d_model):
         super().__init__()
+        # >>> [优化点2: AdaLN] 输出 2*d_model，分别作为 gamma 和 beta
         self.mlp = nn.Sequential(
             nn.Linear(3, d_model // 4),
-            nn.ReLU(),
-            nn.Linear(d_model // 4, d_model),
-            nn.Sigmoid()
+            nn.SiLU(), # SiLU 比 ReLU 在生成调节参数时更平滑稳定
+            nn.Linear(d_model // 4, d_model * 2) 
         )
+        
+        # 初始化最后一步为0，使得初始状态下相当于标准的 LayerNorm
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, x_patch):
         x_fft = torch.fft.rfft(x_patch, dim=-1)
@@ -74,10 +78,13 @@ class PatchFrequencyRouter(nn.Module):
         total = freq_feats.sum(dim=-1, keepdim=True) + 1e-6
         freq_feats = freq_feats / total
         
-        return self.mlp(freq_feats)
+        # 拆分为 Scale(gamma) 和 Shift(beta)
+        ada_params = self.mlp(freq_feats) # [..., 2 * d_model]
+        gamma, beta = ada_params.chunk(2, dim=-1) # 各自 [..., d_model]
+        return gamma, beta
 
 # ================================================================
-# 3. Patch Scale Layer (优化：位置编码 + 残差连接)
+# 3. Patch Scale Layer (Bi-Mamba + AdaLN)
 # ================================================================
 class PatchScaleLayer(nn.Module):
     def __init__(self, configs, patch_len):
@@ -85,84 +92,59 @@ class PatchScaleLayer(nn.Module):
         self.patch_len = patch_len
         self.d_model = configs.d_model
         
-        # 1. Embedding
         self.patch_embed = nn.Linear(patch_len, configs.d_model)
         
-        # 计算 Patch 数量
+        # 恢复非重叠切片，防止最后全连接层参数暴增导致过拟合
         pad_len = (patch_len - configs.seq_len % patch_len) % patch_len
         self.num_patches = (configs.seq_len + pad_len) // patch_len
         
-        # >>> [优化点1] 位置编码 (Positional Embedding) <<<
-        # 让模型知道每个 Patch 是“开头”还是“结尾”，对预测未来至关重要
         self.pos_embedding = nn.Parameter(torch.randn(1, 1, self.num_patches, configs.d_model) * 0.02)
         
-        # 2. Router & Mamba
-        self.router = PatchFrequencyRouter(configs.d_model)
-        
-        self.mamba = Mamba(
-            d_model=configs.d_model,
-            d_state=configs.d_state,
-            d_conv=configs.d_conv,
-            expand=configs.expand
-        )
-        
+        self.router = SpectralAdaLNRouter(configs.d_model)
         self.norm = nn.LayerNorm(configs.d_model)
-        self.dropout_layer = nn.Dropout(configs.dropout)
         
-        # 3. Head
+        # >>> [优化点1: Bi-Mamba] 前向和后向两个 Mamba 块
+        self.mamba_fwd = Mamba(d_model=configs.d_model, d_state=configs.d_state, d_conv=configs.d_conv, expand=configs.expand)
+        self.mamba_bwd = Mamba(d_model=configs.d_model, d_state=configs.d_state, d_conv=configs.d_conv, expand=configs.expand)
+        
+        self.dropout_layer = nn.Dropout(configs.dropout)
         self.head = nn.Linear(self.num_patches * configs.d_model, configs.pred_len)
 
     def forward(self, x, node_embed_map=None):
-        """
-        x: [B, N, L]
-        node_embed_map: [1, N, 1, D]
-        """
         B, N, L = x.shape
         
-        # --- Patching ---
         pad_len = (self.patch_len - L % self.patch_len) % self.patch_len
         x_pad = F.pad(x, (0, pad_len))
+        # 保持 step=patch_len
         x_patches = x_pad.unfold(dimension=-1, size=self.patch_len, step=self.patch_len)
-        x_patches_bn = x_patches.reshape(B, N, -1, self.patch_len) # [B, N, P, S]
+        x_patches_bn = x_patches.reshape(B, N, -1, self.patch_len)
         
-        # --- Embedding ---
-        x_enc = self.patch_embed(x_patches_bn) # [B, N, P, D]
-        
-        # >>> [优化点1] 注入位置编码 (Broadcasting) <<<
-        x_enc = x_enc + self.pos_embedding
-        
-        # 注入 Node Embedding
+        x_enc = self.patch_embed(x_patches_bn) + self.pos_embedding
         if node_embed_map is not None:
             x_enc = x_enc + node_embed_map
             
-        # Reshape for Mamba: [B*N, P, D]
         x_enc_flat = x_enc.reshape(B * N, -1, self.d_model)
         
-        # --- Routing (频域门控) ---
-        # 获取原始 Patch 用于 FFT
+        # --- Spectral AdaLN ---
         x_patches_flat = x_patches.reshape(B * N, -1, self.patch_len)
-        gate_weights = self.router(x_patches_flat) # [B*N, P, D]
+        gamma, beta = self.router(x_patches_flat) 
         
-        # --- [优化点2] 残差连接结构 (Pre-Norm Residual) ---
-        # 保存残差路径
         residual = x_enc_flat 
-        
-        # Norm
         x_norm = self.norm(x_enc_flat)
+        # 用 AdaLN 代替直接乘以 Gate，训练极其稳定
+        x_modulated = x_norm * (1.0 + gamma) + beta 
         
-        # Gating + Mamba
-        x_gated = x_norm * gate_weights
-        x_out = self.mamba(x_gated)
+        # --- Bi-Mamba Scan ---
+        out_fwd = self.mamba_fwd(x_modulated)
+        # 将序列在时间维度(dim=1)翻转后反向扫描，再翻转回来
+        out_bwd = torch.flip(self.mamba_bwd(torch.flip(x_modulated, dims=[1])), dims=[1])
         
-        # Dropout
-        x_out = self.dropout_layer(x_out)
-        
-        # 残差相加：即使 Mamba/Router 表现不好，至少保留原始 Embedding 信息
-        x_out = x_out + residual 
+        x_out = out_fwd + out_bwd
+        x_out = self.dropout_layer(x_out) + residual 
         
         # --- Head ---
-        out_flat = x_out.reshape(B, N, -1) # [B, N, P*D]
-        pred = self.head(out_flat) # [B, N, T]
+        out_flat = x_out.reshape(B, N, -1) 
+        pred = self.head(out_flat) 
         
         return pred
 
@@ -172,55 +154,37 @@ class PatchScaleLayer(nn.Module):
 class Model(nn.Module):
     def __init__(self, configs):
         super().__init__()
-        # 默认参数保护
-        if not hasattr(configs, 'd_model'): configs.d_model = 128
-        if not hasattr(configs, 'd_state'): configs.d_state = 16
-        if not hasattr(configs, 'd_conv'): configs.d_conv = 4
-        if not hasattr(configs, 'expand'): configs.expand = 2
-        
+        for attr, val in zip(['d_model','d_state','d_conv','expand','dropout'], [128, 16, 4, 2, 0.1]):
+            if not hasattr(configs, attr): setattr(configs, attr, val)
+            
         self.configs = configs
         self.revin = RevIN(configs.enc_in)
         
-        # 多尺度设定
         self.patch_sizes = [8, 16, 32]
+        self.scales = nn.ModuleList([PatchScaleLayer(configs, p) for p in self.patch_sizes])
         
-        self.scales = nn.ModuleList([
-            PatchScaleLayer(configs, p_len) for p_len in self.patch_sizes
-        ])
+        # >>> [优化点3: 变量特异性融合] 
+        # 形状为 [1, 变量数, 1, 尺度数]，让每个变量自己学习最需要哪个尺度
+        self.scale_weights = nn.Parameter(torch.ones(1, configs.enc_in, 1, len(self.patch_sizes)))
         
-        # 简单的可学习权重融合
-        self.scale_weights = nn.Parameter(torch.ones(len(self.patch_sizes)))
-        
-        # Node Embedding: 给每个变量一个独立的身份标识
         self.node_embed = nn.Parameter(torch.randn(1, configs.enc_in, 1, configs.d_model) * 0.02)
 
     def forward(self, x, x_mark=None, y_true=None):
-        """
-        x: [B, Length, Variables]
-        """
-        # 1. RevIN Normalization
         x = self.revin(x, 'norm')
         x = x.permute(0, 2, 1) # [B, N, L]
         
-        # 2. Multi-Scale Processing
         outputs = []
         for layer in self.scales:
-            # 显式传入 node_embed
-            out = layer(x, node_embed_map=self.node_embed)
-            outputs.append(out)
+            outputs.append(layer(x, node_embed_map=self.node_embed))
             
-        # 3. Weighted Fusion
-        # 使用 Softmax 保证权重之和为 1，数值更稳定
-        weights = F.softmax(self.scale_weights, dim=0)
+        # 将三个尺度的输出堆叠: [B, N, T, 3]
+        outputs_stack = torch.stack(outputs, dim=-1) 
         
-        final_pred = torch.zeros_like(outputs[0])
-        for i, out in enumerate(outputs):
-            final_pred += out * weights[i]
-            
+        # 变量特异性 Softmax 权重: [1, N, 1, 3]
+        weights = F.softmax(self.scale_weights, dim=-1)
+        
+        # 加权融合: [B, N, T]
+        final_pred = (outputs_stack * weights).sum(dim=-1) 
+        
         final_pred = final_pred.permute(0, 2, 1) # [B, T, N]
-        
-        # 4. RevIN Denormalization
         return self.revin(final_pred, 'denorm')
-
-
- 
